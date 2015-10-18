@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 2.8)
 
 project(image_view_terminal)
 
-find_package(catkin REQUIRED image_transport)
+find_package(catkin REQUIRED cv_bridge image_transport)
 find_package(PkgConfig)
 
 pkg_check_modules(CACA REQUIRED caca)
