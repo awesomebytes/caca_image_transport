@@ -8,82 +8,134 @@
 class Display
 {
 public:
-  Display() : _previous_buffer_length(0)
+  Display() : dither_(0), previous_terminal_check_(0, 0), font_width_(6), font_height_(10)
   {
-    cv_ = caca_create_canvas(0, 0);
-    if(!cv_)
+    // Create the canvas on which the dithered image will be
+    canvas_ = caca_create_canvas(0, 0);
+    if(!canvas_)
     {
-        ROS_ERROR("Unable to initialise libcaca");
+        ROS_ERROR("Unable to initialize libcaca");
         ros::shutdown();
     }
-    display_ = caca_create_display_with_driver(cv_, "slang");
+    caca_set_color_ansi(canvas_, CACA_DEFAULT, CACA_TRANSPARENT);
 
-    //cv_.setColorANSI(CACA_DEFAULT, CACA_TRANSPARENT);
-    //int bottom = 10, right = 10;
-    //dit_.reset(new Dither(32, right, bottom, 4*right, 0x00FF0000, 0x0000FF00, 0x000000FF, 0xFFFFFFFF));
+    // Define the display to display the canvas
+    display_ = caca_create_display_with_driver(canvas_, "slang");
+    // "slang" was chosen arbitrary. When calling caca_get_display_driver_list,
+    // x11, gl: open up a new window
+    // slang, ncurses: display in the current terminal
+    // raw: displays garbage
+    // null: displays nothing
   }
-  
+
   ~Display()
   {
-    caca_free_canvas(cv_);
+    // Delete what is currently displayed
+    caca_clear_canvas(canvas_);
+    caca_refresh_display(display_);
+
+    // Free ressources
+    caca_free_dither(dither_);
+    caca_free_display(display_);
+    caca_free_canvas(canvas_);
   }
 
+  /* Callback for when we receive an image message
+   * @param msg the image message
+   */
   void callback(const sensor_msgs::ImageConstPtr& msg)
   {
     // Figure out the canvas size
-    unsigned int cols = tputCall(1), lines = tputCall(0), font_width = 6, font_height = 10;
-    int lines_max = cols * msg->height * font_width / msg->width / font_height;
+    if (ros::Time::now() > previous_terminal_check_ + ros::Duration(0.5))
+    {
+      terminal_width_ = tputCall(false);
+      terminal_height_ = tputCall(true);
+      previous_terminal_check_ = ros::Time::now();
+    }
+    unsigned int cols = terminal_width_, lines = terminal_height_;
+    int lines_max = cols * msg->height * font_width_ / (msg->width * font_height_);
     if (lines_max <= lines)
       lines = lines_max;
     else
-      cols = lines * msg->width * font_height / msg->height / font_width;
+      cols = lines * msg->width * font_height_ / (msg->height * font_width_);
 
-    // Create the canvas
-    caca_set_canvas_size(cv_, cols, lines);
-    caca_set_color_ansi(cv_, CACA_DEFAULT, CACA_TRANSPARENT);
-    caca_clear_canvas(cv_);
+    // Update the canvas
+    caca_clear_canvas(canvas_);
+    caca_set_canvas_size(canvas_, cols, lines);
 
     // Convert the image to RGB or Grayscale
     sensor_msgs::ImagePtr img;
     if (sensor_msgs::image_encodings::isColor(msg->encoding))
-      img = cv_bridge::toCvShare(msg, sensor_msgs::image_encodings::BGR8)->toImageMsg();
+      // This is an optimization in case our image is BGR (to avoid copying data)
+      if (msg->encoding == sensor_msgs::image_encodings::BGR8)
+      {
+        img = cv_bridge::toCvShare(msg, sensor_msgs::image_encodings::BGR8)->toImageMsg();
+      } else {
+        img = cv_bridge::toCvShare(msg, sensor_msgs::image_encodings::RGB8)->toImageMsg();
+      }
     else
       img = cv_bridge::toCvShare(msg, sensor_msgs::image_encodings::MONO8)->toImageMsg();
 
-    unsigned int depth = sensor_msgs::image_encodings::numChannels(img->encoding);
-    int bpp = sensor_msgs::image_encodings::bitDepth(img->encoding) * depth, rmask, gmask, bmask, amask = 0;
-    rmask = 0x00ff0000;
-    gmask = 0x0000ff00;
-    bmask = 0x000000ff;
-    if (sensor_msgs::image_encodings::hasAlpha(img->encoding))
-      amask = 0xff000000;
+    if ((image_property_.encoding != img->encoding) || (image_property_.width != img->width) ||
+        (image_property_.height != img->height) || (image_property_.step != img->step))
+      OnImagePropertyChangeCallback(msg);
 
-    caca_dither *dither = caca_create_dither(bpp, img->width, img->height, img->step,
-                                     rmask, gmask, bmask, amask);
-    caca_set_dither_algorithm(dither, "fstein");
-    caca_dither_bitmap(cv_, 0, 0, cols, lines, dither, reinterpret_cast<const void*>(&img->data[0]));
+    caca_dither_bitmap(canvas_, 0, 0, cols, lines, dither_, reinterpret_cast<const void*>(&img->data[0]));
 
-    size_t len;
-    char format[] = "utf8";
-    void *export_buffer = caca_export_canvas_to_memory(cv_, format, &len);
-    if(!export_buffer)
-    {
-      ROS_ERROR("Can't export to format '%s'", format);
-    }
-    else
-    {
-      //std::cout << std::string(_previous_buffer_length, '\b') << std::cout << std::string(reinterpret_cast<char *>(export_buffer), len) << std::endl;
-        caca_refresh_display(display_);
-      _previous_buffer_length = len;
-      free(export_buffer);
-    }
+    caca_refresh_display(display_);
+
+    // Check whether we should exit
+    caca_event_t ev;
+    caca_get_event(display_, CACA_EVENT_ANY, &ev, 0);
+    if (caca_get_event_type(&ev) == CACA_EVENT_KEY_PRESS)
+      ros::shutdown();
   }
 
 private:
-  int tputCall(int line_col)
+  /* Callback called when the image dimensions change */
+  void OnImagePropertyChangeCallback(const sensor_msgs::ImageConstPtr& msg)
+  {
+    if (dither_)
+      caca_free_dither(dither_);
+
+    image_property_.encoding = msg->encoding;
+    image_property_.width = msg->width;
+    image_property_.height = msg->height;
+    image_property_.step = msg->step;
+    
+    // Figure out the color masks
+    int rmask, gmask, bmask, amask = 0;
+    if (image_property_.encoding == sensor_msgs::image_encodings::BGR8)
+    {
+      rmask = 0x00ff0000;
+      gmask = 0x0000ff00;
+      bmask = 0x000000ff;
+    } else {
+      rmask = 0x000000ff;
+      gmask = 0x0000ff00;
+      bmask = 0x00ff0000;
+    }
+
+    if (sensor_msgs::image_encodings::hasAlpha(image_property_.encoding))
+      amask = 0xff000000;
+
+    // Create the dither
+    unsigned int depth = sensor_msgs::image_encodings::numChannels(image_property_.encoding);
+    int bpp = sensor_msgs::image_encodings::bitDepth(image_property_.encoding) * depth;
+
+    dither_ = caca_create_dither(bpp, image_property_.width, image_property_.height, image_property_.step,
+                                     rmask, gmask, bmask, amask);
+    caca_set_dither_algorithm(dither_, "fstein");
+  }
+
+  /* Function to check the dimensions of the terminal
+   * @param line_col true if we choose to compute the number of lines.
+   *                 If false, it checks the number of columns.
+   */
+  static int tputCall(bool line_col)
   {
     FILE* pipe;
-    if (line_col == 0)
+    if (line_col)
       pipe = popen("tput lines", "r");
     else
       pipe = popen("tput cols", "r");
@@ -100,32 +152,38 @@ private:
     return res;
   }
 
-  caca_canvas_t *cv_;
-  int _previous_buffer_length;
+  // Dither to dither the image
+  caca_dither *dither_;
+  // Canvas where to dither the image
+  caca_canvas_t *canvas_;
+  // Display to display the image
   caca_display_t *display_;
+  // Timer to check the terminal dimensions
+  ros::Time previous_terminal_check_;
+  // Terminal width
+  int terminal_width_;
+  // Terminal height
+  int terminal_height_;
+  // Font width
+  int font_width_;
+  // Font height
+  int font_height_;
+  // Image message used to store previous image properties
+  sensor_msgs::Image image_property_;
 };
 
 int
 main(int argc, char** argv)
 {
-  char const * const *list;
-  list = caca_get_display_driver_list();
-  for(int i = 0; list[i]; i += 2)
-  {
-    std::cout << list[i] << std::endl;
-  }
-
   ros::init(argc, argv, "image_view_terminal");
-  ros::NodeHandle nh;
+  ros::NodeHandle nh("~");
 
-  // Make our node available to sigintHandler
-  ros::NodeHandle nh_;
+  // Define the image topic
   std::string image_topic;
-  nh_.param("image", image_topic, std::string("/camera/rgb/image_color"));
+  nh.param("image", image_topic, std::string("/camera/rgb/image_color"));
 
   // initialize 
   Display display;
-  ROS_INFO("Caca initialized");
 
   image_transport::ImageTransport it(nh);
   image_transport::Subscriber sub = it.subscribe(image_topic, 1, boost::bind(&Display::callback, &display, _1));
