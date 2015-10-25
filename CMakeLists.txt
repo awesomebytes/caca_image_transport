@@ -6,8 +6,6 @@ find_package(catkin REQUIRED cv_bridge image_transport)
 find_package(PkgConfig)
 
 pkg_check_modules(CACA REQUIRED caca)
-message(INFO ${CACA_LIBRARIES})
-message(INFO ${CACA_INCLUDE_DIRS})
 
 catkin_package()
 
